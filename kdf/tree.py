@@ -54,6 +54,26 @@ DEFAULT_SALT = bytes(range(32))
 PREFIX = b"GSB-KDF-TREE-v1"
 SPLIT_PURPOSE = b"split"
 
+_MAX_FIELD_BYTES = 65535
+
+
+def _validate_length(length: int) -> None:
+    """Reject any length outside the inclusive 1..MAX_LENGTH range."""
+    if isinstance(length, bool) or not isinstance(length, int):
+        raise ValueError("length must be an int in 1..MAX_LENGTH")
+    if length < 1 or length > MAX_LENGTH:
+        raise ValueError("length must be in 1..MAX_LENGTH")
+
+
+def _validate_domain_field(value: bytes, name: str) -> None:
+    """Validate a non-empty bytes domain-separation field."""
+    if not isinstance(value, bytes):
+        raise ValueError(f"{name} must be bytes")
+    if len(value) == 0:
+        raise ValueError(f"{name} must be non-empty")
+    if len(value) > _MAX_FIELD_BYTES:
+        raise ValueError(f"{name} must be at most 65535 bytes")
+
 
 def extract(salt: bytes, ikm: bytes) -> bytes:
     """Extract a 32-byte pseudorandom key from input keying material.
@@ -67,7 +87,10 @@ def extract(salt: bytes, ikm: bytes) -> bytes:
     returning ikm itself, or keying the HMAC with b"" is invalid. The result is
     always 32 bytes and identical inputs always return identical bytes.
     """
-    raise NotImplementedError
+    # Defect 1 fix: an empty salt selects the mandatory default salt instead
+    # of being passed through as an empty HMAC key / skipping extraction.
+    effective_salt = DEFAULT_SALT if salt == b"" else salt
+    return hmac.new(effective_salt, ikm, hashlib.sha256).digest()
 
 
 def expand(prk: bytes, info: bytes, length: int) -> bytes:
@@ -86,7 +109,24 @@ def expand(prk: bytes, info: bytes, length: int) -> bytes:
     of T_1 through T_n truncated to length bytes. Truncation must preserve the
     leading bytes of the final block exactly.
     """
-    raise NotImplementedError
+    # Defect 3 fix: enforce the 255-block ceiling before producing anything,
+    # so an over-limit request raises instead of being silently truncated.
+    _validate_length(length)
+
+    block_count = (length + hashlib.sha256().digest_size - 1) // 32
+    blocks = []
+    previous_block = b""
+    for i in range(1, block_count + 1):
+        # Defect 2 fix: the single-byte counter is the FIRST byte of the block.
+        # Defect 4 fix: info is mixed into EVERY block, not only T_1.
+        previous_block = hmac.new(
+            prk,
+            bytes([i]) + info + previous_block,
+            hashlib.sha256,
+        ).digest()
+        blocks.append(previous_block)
+
+    return b"".join(blocks)[:length]
 
 
 def derive(secret: bytes, salt: bytes, info: bytes, length: int) -> bytes:
@@ -101,7 +141,11 @@ def derive(secret: bytes, salt: bytes, info: bytes, length: int) -> bytes:
     over-limit length also raises ValueError. The empty-salt default behavior
     belongs to extract and must apply here as well.
     """
-    raise NotImplementedError
+    # Defect 6 fix: reject length <= 0 (and over-limit lengths) up front
+    # instead of letting expand return an empty/truncated byte string.
+    _validate_length(length)
+    prk = extract(salt, secret)
+    return expand(prk, info, length)
 
 
 def derive_key(
@@ -129,7 +173,20 @@ def derive_key(
     from the encoded info, or using purpose only for the first block, is
     invalid. Invalid context, purpose or length raises ValueError.
     """
-    raise NotImplementedError
+    _validate_domain_field(context, "context")
+    _validate_domain_field(purpose, "purpose")
+    _validate_length(length)
+
+    # Defect 5 fix: purpose is length-prefixed and included in the encoded
+    # info handed to expand, where it participates in every HMAC block.
+    encoded_info = (
+        PREFIX
+        + len(context).to_bytes(2, "big")
+        + context
+        + len(purpose).to_bytes(2, "big")
+        + purpose
+    )
+    return derive(secret, b"", encoded_info, length)
 
 
 def split(secret: bytes, contexts: list[bytes]) -> dict:
@@ -146,7 +203,20 @@ def split(secret: bytes, contexts: list[bytes]) -> dict:
     common prefix caused by reusing the first derivation. Derivation for one
     context must not depend on the position of that context in the input.
     """
-    raise NotImplementedError
+    derived: dict[bytes, bytes] = {}
+    seen: set[bytes] = set()
+
+    for context in contexts:
+        _validate_domain_field(context, "context")
+        if context in seen:
+            raise ValueError(f"duplicate context: {context!r}")
+        seen.add(context)
+
+        # Defect 7 fix: every context gets a fresh, full derive_key call. No
+        # first block / prefix is cached and shared across contexts.
+        derived[context] = derive_key(secret, context, SPLIT_PURPOSE, 32)
+
+    return derived
 
 
 def verify_derivation(
@@ -165,7 +235,11 @@ def verify_derivation(
     Return True only for an exact 32-byte match, and return False for a wrong
     value of any length. Invalid derivation parameters raise ValueError.
     """
-    raise NotImplementedError
+    expected = derive_key(secret, context, purpose, 32)
+    # Defect 8 fix: constant-time comparison instead of ordinary ``==``.
+    # Return the comparison result directly; compare_digest itself returns
+    # False when the lengths differ.
+    return hmac.compare_digest(expected, candidate)
 
 
 def validate_policy(policy: dict) -> list[str]:
@@ -184,7 +258,21 @@ def validate_policy(policy: dict) -> list[str]:
     A valid policy returns an empty list. Checking context is mandatory: a
     policy with an empty context must never be reported as valid.
     """
-    raise NotImplementedError
+    problems: list[str] = []
+
+    if policy["length"] > MAX_LENGTH:
+        problems.append("length-above-limit")
+
+    # Defect 9 fix: context absence / None / b"" is reported, not skipped.
+    context = policy.get("context")
+    if context is None or context == b"":
+        problems.append("context-empty")
+
+    purpose = policy.get("purpose")
+    if purpose is None or purpose == b"":
+        problems.append("purpose-missing")
+
+    return problems
 
 
 def kdf_batch(requests: list[dict], policy: dict) -> dict:
@@ -207,4 +295,34 @@ def kdf_batch(requests: list[dict], policy: dict) -> dict:
     request's context. Inputs and policy must not be mutated. Empty requests
     returns an empty dict.
     """
-    raise NotImplementedError
+    results: dict = {}
+    seen_ids: set = set()
+
+    for request in requests:
+        request_id = request["id"]
+        if request_id in seen_ids:
+            raise ValueError(f"duplicate request id: {request_id!r}")
+        seen_ids.add(request_id)
+
+        # Defect 10 fix: start from a FRESH copy of the original policy for
+        # every request, so overrides / encoded state from an earlier request
+        # can never leak into a later one. policy itself is never mutated.
+        merged = dict(policy)
+        merged.update(request)
+
+        problems = validate_policy(merged)
+        if problems:
+            raise ValueError(
+                f"invalid merged policy for id {request_id!r}: "
+                + ", ".join(problems)
+            )
+
+        # A brand-new derivation per request; no PRK, block or info cache.
+        results[request_id] = derive_key(
+            request["secret"],
+            merged["context"],
+            merged["purpose"],
+            merged["length"],
+        )
+
+    return results
